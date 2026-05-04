@@ -50,7 +50,7 @@ def process_video_task(job_id: str, file_path: str, filename: str, voice_name: s
     video_file = None
     
     try:
-        # 🚨 FIX 1: Render မှ API Key များကို Space နှင့် Quotes များ အလိုအလျောက် ဖယ်ရှားပေးခြင်း 🚨
+        # API Key ရှင်းလင်းခြင်း
         render_key = os.getenv("GEMINI_API_KEY", "")
         if render_key:
             render_key = render_key.strip().replace('"', '').replace("'", "")
@@ -77,48 +77,49 @@ def process_video_task(job_id: str, file_path: str, filename: str, voice_name: s
         try:
             model = genai.GenerativeModel("gemini-2.5-flash")
             response = model.generate_content([prompt, video_file])
-            # 🚨 FIX 2: Safety Policy ကြောင့် စာသားမရလျှင် Error ဖမ်းခြင်း 🚨
-            try:
-                transcript = response.text
-            except ValueError:
-                transcript = ""
+            transcript = response.text if response.text else ""
         except Exception as e_inner:
             print(f"2.5 Flash Failed: {e_inner}. Falling back to 1.5 Flash...")
             model = genai.GenerativeModel("gemini-1.5-flash")
             response = model.generate_content([prompt, video_file])
-            try:
-                transcript = response.text
-            except ValueError:
-                transcript = ""
+            transcript = response.text if response.text else ""
                 
-        # 🚨 FIX 3: Transcript အလွတ်ကြီးဖြစ်နေလျှင် Invalid Argument မတက်စေရန် စစ်ဆေးခြင်း 🚨
         if not transcript or not transcript.strip():
-            raise Exception("Video ထဲမှ စကားပြောသံကို ရှာမတွေ့ပါ (သို့) AI Safety Policy အရ ပိတ်ပင်ခံရပါသည်။ တခြား Video ဖြင့် စမ်းကြည့်ပါ။")
+            raise Exception("Video ထဲမှ စကားပြောသံကို ရှာမတွေ့ပါ (သို့) AI Safety Policy အရ ပိတ်ပင်ခံရပါသည်။")
             
         jobs[job_id]["transcript"] = transcript
+        clean_transcript = transcript.strip()
         
         jobs[job_id]["status"] = "generating_audio"
-        tts_model = genai.GenerativeModel("gemini-3.1-flash-tts-preview")
         
-        # Prompt အား ပိုမိုရိုးရှင်းအောင် ပြင်ဆင်ခြင်း
-        clean_transcript = transcript.strip()
-        tts_prompt = f"Voice character: {voice_name}. Read this text: {clean_transcript}"
-        
-        tts_response = tts_model.generate_content(tts_prompt)
-        
-        audio_data = None
-        if tts_response.candidates:
-            for part in tts_response.candidates[0].content.parts:
-                if hasattr(part, 'inline_data') and part.inline_data.data:
-                    audio_data = part.inline_data.data
-                    break
-                    
-        if not audio_data:
-            raise Exception("TTS Model မှ အသံဖိုင် ပြန်မချပေးပါ။")
+        # 🚨 FIX: အသံထုတ်သည့်အပိုင်းတွင် Error တက်ပါက gTTS သို့ အလိုအလျောက် ပြောင်းလဲမည့်စနစ် 🚨
+        try:
+            tts_model = genai.GenerativeModel("gemini-3.1-flash-tts-preview")
+            # Prompt အား အရိုးရှင်းဆုံးဖြစ်အောင် ပြင်ဆင်ထားသည်
+            tts_response = tts_model.generate_content(clean_transcript)
             
-        fd, tts_audio_path = tempfile.mkstemp(suffix=".mp3")
-        with os.fdopen(fd, 'wb') as f:
-            f.write(audio_data)
+            audio_data = None
+            if tts_response.candidates:
+                for part in tts_response.candidates[0].content.parts:
+                    if hasattr(part, 'inline_data') and part.inline_data.data:
+                        audio_data = part.inline_data.data
+                        break
+                        
+            if not audio_data:
+                raise Exception("Empty Audio Data")
+                
+            fd, tts_audio_path = tempfile.mkstemp(suffix=".mp3")
+            with os.fdopen(fd, 'wb') as f:
+                f.write(audio_data)
+                
+        except Exception as tts_err:
+            print(f"Gemini TTS Failed ({tts_err}). Automatically falling back to gTTS...")
+            # Gemini TTS Error တက်ပါက gTTS ဖြင့် အစားထိုး အလုပ်လုပ်မည်
+            from gtts import gTTS
+            fd, tts_audio_path = tempfile.mkstemp(suffix=".mp3")
+            os.close(fd)
+            tts = gTTS(text=clean_transcript, lang='my')
+            tts.save(tts_audio_path)
             
         jobs[job_id]["status"] = "merging_video"
         video_dur = get_media_duration(file_path)
