@@ -4,6 +4,7 @@ import tempfile
 import time
 import subprocess
 import json
+import traceback  # အသစ် ထပ်တိုးထားသော Library (Error အတိအကျသိရန်)
 from fastapi import FastAPI, UploadFile, File, Form, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 import google.generativeai as genai
@@ -51,7 +52,7 @@ def process_video_task(job_id: str, file_path: str, filename: str, voice_name: s
     tts_audio_path = ""
     
     try:
-        # Step 1: Video မှ မြန်မာ transcript ထုတ်ခြင်း (Gemini 3 Flash Preview -> 2.5 Fallback)
+        # Step 1: Transcribing
         jobs[job_id]["status"] = "transcribing"
         video_file = genai.upload_file(path=file_path)
         
@@ -60,18 +61,17 @@ def process_video_task(job_id: str, file_path: str, filename: str, voice_name: s
             video_file = genai.get_file(video_file.name)
             
         if video_file.state.name == "FAILED":
-            raise Exception("Gemini failed to process video.")
+            raise Exception("Gemini API failed to process the uploaded video file.")
             
         prompt = "You are a professional translator. Listen to this video and provide an accurate Burmese transcript of the speech. Only return the translated Burmese text without any other comments."
         transcript = ""
         
         try:
-            # Gemini 3 Flash Preview အား အသုံးပြုခြင်း
             model = genai.GenerativeModel("gemini-3-flash-preview")
             response = model.generate_content([prompt, video_file])
             transcript = response.text
-        except Exception:
-            # Fallback အနေဖြင့် Gemini 2.5 Flash ကို အသုံးပြုခြင်း
+        except Exception as e_inner:
+            print(f"3 Flash Failed: {e_inner}. Falling back to 2.5 Flash...")
             model = genai.GenerativeModel("gemini-2.5-flash")
             response = model.generate_content([prompt, video_file])
             transcript = response.text
@@ -79,9 +79,9 @@ def process_video_task(job_id: str, file_path: str, filename: str, voice_name: s
         jobs[job_id]["transcript"] = transcript
         genai.delete_file(video_file.name)
         
-        # Step 2: Transcript မှ Voice Over ပြောင်းခြင်း (Gemini 3.1 Flash TTS Preview)
+        # Step 2: Generating Audio
         jobs[job_id]["status"] = "generating_audio"
-        tts_model = genai.GenerativeModel("gemini-3.1-flash-tts-preview") #
+        tts_model = genai.GenerativeModel("gemini-3.1-flash-tts-preview")
         tts_prompt = f"Voice Profile: {voice_name}\nRead the following text naturally and fluently:\n{transcript}"
         tts_response = tts_model.generate_content(tts_prompt)
         
@@ -93,15 +93,14 @@ def process_video_task(job_id: str, file_path: str, filename: str, voice_name: s
                     break
                     
         if not audio_data:
-            raise Exception("No audio data returned from TTS model.")
+            raise Exception("No audio data returned from TTS model. Response might be blocked or empty.")
             
         fd, tts_audio_path = tempfile.mkstemp(suffix=".mp3")
         with os.fdopen(fd, 'wb') as f:
             f.write(audio_data)
             
-        # Step 3 & 4: Audio နှင့် Video ကြာချိန် ညှိနှိုင်းပြီး ပေါင်းစပ်ခြင်း
+        # Step 3 & 4: Merging Video
         jobs[job_id]["status"] = "merging_video"
-        
         video_dur = get_media_duration(file_path)
         audio_dur = get_media_duration(tts_audio_path)
         
@@ -111,10 +110,8 @@ def process_video_task(job_id: str, file_path: str, filename: str, voice_name: s
         if audio_dur > video_dur and video_dur > 0:
             required_a_speed = audio_dur / video_dur
             if required_a_speed <= 1.1:
-                # 1.1x အတွင်းဆိုလျှင် audio ကိုသာ မြန်လိုက်မည်
                 a_tempo_factor = required_a_speed
             else:
-                # 1.1x ထက်ကျော်လျှင် audio ကို 1.1x ထားပြီး ကျန်တာကို video slow ချမည်
                 a_tempo_factor = 1.1
                 new_audio_dur = audio_dur / 1.1
                 v_pts_factor = new_audio_dur / video_dur
@@ -122,7 +119,6 @@ def process_video_task(job_id: str, file_path: str, filename: str, voice_name: s
         fd2, output_video_path = tempfile.mkstemp(suffix=".mp4")
         os.close(fd2)
         
-        # FFmpeg ဖြင့် Video နှင့် Audio အား ပေါင်းစပ်ခြင်း
         cmd = [
             "ffmpeg", "-y",
             "-i", file_path,
@@ -135,9 +131,11 @@ def process_video_task(job_id: str, file_path: str, filename: str, voice_name: s
             output_video_path
         ]
         
-        subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        process = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        if process.returncode != 0:
+            raise Exception(f"FFmpeg Error: {process.stderr}")
         
-        # Step 5: အချောသတ်ဗီဒီယိုအား Google Drive သို့ တင်ခြင်း
+        # Step 5: Uploading Final to Drive
         jobs[job_id]["status"] = "uploading_final_to_drive"
         drive_link = upload_to_drive(output_video_path, filename)
         jobs[job_id]["drive_link"] = drive_link
@@ -146,9 +144,15 @@ def process_video_task(job_id: str, file_path: str, filename: str, voice_name: s
         
     except Exception as e:
         jobs[job_id]["status"] = "failed"
-        jobs[job_id]["error"] = str(e)
+        # 🚨 Error အတိအကျကို UI ဆီ ပို့ပေးမည့် အပိုင်း 🚨
+        error_name = type(e).__name__
+        error_msg = str(e) if str(e).strip() else repr(e)
+        jobs[job_id]["error"] = f"[{error_name}] {error_msg}"
+        
+        print(f"--- SERVER ERROR LOG (Job: {job_id}) ---")
+        print(traceback.format_exc())
+        print("----------------------------------------")
     finally:
-        # ယာယီဖိုင်များအား ပြန်လည်ဖျက်သိမ်းခြင်း
         for path in [file_path, tts_audio_path, output_video_path]:
             if path and os.path.exists(path): os.remove(path)
 
