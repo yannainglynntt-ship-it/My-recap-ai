@@ -44,13 +44,12 @@ def upload_to_drive(file_path, filename):
     file = service.files().create(body=file_metadata, media_body=media, fields='id, webContentLink').execute()
     return file.get('webContentLink')
 
-# user_api_key ကို ထပ်မံလက်ခံမည့်အပိုင်း
 def process_video_task(job_id: str, file_path: str, filename: str, voice_name: str, user_api_key: str):
     output_video_path = ""
     tts_audio_path = ""
+    video_file = None
     
     try:
-        # 🚨 အရေးကြီး: User Key ပါရင် အဲဒါသုံးမယ်၊ မပါရင် Render က Key ကို သုံးမယ်
         active_key = user_api_key.strip() if user_api_key else os.getenv("GEMINI_API_KEY")
         if not active_key:
             raise Exception("API Key မရှိပါ။ ကျေးဇူးပြု၍ သင့်ကိုယ်ပိုင် Gemini API Key အား ထည့်သွင်းပါ။")
@@ -58,30 +57,32 @@ def process_video_task(job_id: str, file_path: str, filename: str, voice_name: s
         genai.configure(api_key=active_key)
 
         jobs[job_id]["status"] = "transcribing"
-        video_file = genai.upload_file(path=file_path)
+        
+        # 🚨 FIX 1: API က 400 Error မပြအောင် mime_type အတိအကျ သတ်မှတ်ခြင်း 🚨
+        video_file = genai.upload_file(path=file_path, mime_type="video/mp4")
         
         while video_file.state.name == "PROCESSING":
-            time.sleep(2)
+            time.sleep(3)
             video_file = genai.get_file(video_file.name)
             
         if video_file.state.name == "FAILED":
-            raise Exception("Gemini API က ဗီဒီယိုဖိုင်အား လက်မခံပါ။")
+            raise Exception("Gemini API က ဗီဒီယိုဖိုင်အား Process လုပ်ရာတွင် Error ဖြစ်သွားပါသည်။")
             
         prompt = "You are a professional translator. Listen to this video and provide an accurate Burmese transcript of the speech. Only return the translated Burmese text without any other comments."
         transcript = ""
         
+        # 🚨 FIX 2: Video ဖတ်ရန်အတွက် အငြိမ်ဆုံး Model ကို ပြောင်းသုံးခြင်း 🚨
         try:
-            model = genai.GenerativeModel("gemini-3-flash-preview")
+            model = genai.GenerativeModel("gemini-2.5-flash")
             response = model.generate_content([prompt, video_file])
             transcript = response.text
         except Exception as e_inner:
-            print(f"3 Flash Failed: {e_inner}. Falling back to 2.5 Flash...")
-            model = genai.GenerativeModel("gemini-2.5-flash")
+            print(f"2.5 Flash Failed: {e_inner}. Falling back to 1.5 Flash...")
+            model = genai.GenerativeModel("gemini-1.5-flash")
             response = model.generate_content([prompt, video_file])
             transcript = response.text
             
         jobs[job_id]["transcript"] = transcript
-        genai.delete_file(video_file.name)
         
         jobs[job_id]["status"] = "generating_audio"
         tts_model = genai.GenerativeModel("gemini-3.1-flash-tts-preview")
@@ -145,17 +146,29 @@ def process_video_task(job_id: str, file_path: str, filename: str, voice_name: s
         
     except Exception as e:
         jobs[job_id]["status"] = "failed"
-        jobs[job_id]["error"] = str(e)
+        error_msg = str(e) if str(e).strip() else repr(e)
+        jobs[job_id]["error"] = f"{error_msg}"
+        print(f"--- SERVER ERROR LOG (Job: {job_id}) ---")
+        print(traceback.format_exc())
     finally:
+        if video_file:
+            try:
+                genai.delete_file(video_file.name)
+            except:
+                pass
         for path in [file_path, tts_audio_path, output_video_path]:
-            if path and os.path.exists(path): os.remove(path)
+            if path and os.path.exists(path): 
+                try:
+                    os.remove(path)
+                except:
+                    pass
 
-# 🚨 user_api_key ကို လက်ခံမည့် Endpoint 🚨
 @app.post("/api/upload")
 async def upload_video(
     background_tasks: BackgroundTasks, 
     file: UploadFile = File(...), 
-    voice: str = Form("Fenrir (Male)"), 
+    voice: str = Form("Fenrir (Male)"),
+    ratio: str = Form("9:16"),
     user_api_key: str = Form(None)
 ):
     job_id = str(uuid.uuid4())
