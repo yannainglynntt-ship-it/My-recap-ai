@@ -4,7 +4,7 @@ import tempfile
 import time
 import subprocess
 import json
-import traceback  # အသစ် ထပ်တိုးထားသော Library (Error အတိအကျသိရန်)
+import traceback
 from fastapi import FastAPI, UploadFile, File, Form, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 import google.generativeai as genai
@@ -20,9 +20,6 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-genai.configure(api_key=GEMINI_API_KEY)
 
 jobs = {}
 
@@ -47,12 +44,19 @@ def upload_to_drive(file_path, filename):
     file = service.files().create(body=file_metadata, media_body=media, fields='id, webContentLink').execute()
     return file.get('webContentLink')
 
-def process_video_task(job_id: str, file_path: str, filename: str, voice_name: str):
+# user_api_key ကို ထပ်မံလက်ခံမည့်အပိုင်း
+def process_video_task(job_id: str, file_path: str, filename: str, voice_name: str, user_api_key: str):
     output_video_path = ""
     tts_audio_path = ""
     
     try:
-        # Step 1: Transcribing
+        # 🚨 အရေးကြီး: User Key ပါရင် အဲဒါသုံးမယ်၊ မပါရင် Render က Key ကို သုံးမယ်
+        active_key = user_api_key.strip() if user_api_key else os.getenv("GEMINI_API_KEY")
+        if not active_key:
+            raise Exception("API Key မရှိပါ။ ကျေးဇူးပြု၍ သင့်ကိုယ်ပိုင် Gemini API Key အား ထည့်သွင်းပါ။")
+            
+        genai.configure(api_key=active_key)
+
         jobs[job_id]["status"] = "transcribing"
         video_file = genai.upload_file(path=file_path)
         
@@ -61,7 +65,7 @@ def process_video_task(job_id: str, file_path: str, filename: str, voice_name: s
             video_file = genai.get_file(video_file.name)
             
         if video_file.state.name == "FAILED":
-            raise Exception("Gemini API failed to process the uploaded video file.")
+            raise Exception("Gemini API က ဗီဒီယိုဖိုင်အား လက်မခံပါ။")
             
         prompt = "You are a professional translator. Listen to this video and provide an accurate Burmese transcript of the speech. Only return the translated Burmese text without any other comments."
         transcript = ""
@@ -79,7 +83,6 @@ def process_video_task(job_id: str, file_path: str, filename: str, voice_name: s
         jobs[job_id]["transcript"] = transcript
         genai.delete_file(video_file.name)
         
-        # Step 2: Generating Audio
         jobs[job_id]["status"] = "generating_audio"
         tts_model = genai.GenerativeModel("gemini-3.1-flash-tts-preview")
         tts_prompt = f"Voice Profile: {voice_name}\nRead the following text naturally and fluently:\n{transcript}"
@@ -93,13 +96,12 @@ def process_video_task(job_id: str, file_path: str, filename: str, voice_name: s
                     break
                     
         if not audio_data:
-            raise Exception("No audio data returned from TTS model. Response might be blocked or empty.")
+            raise Exception("TTS Model မှ အသံဖိုင် ပြန်မချပေးပါ။")
             
         fd, tts_audio_path = tempfile.mkstemp(suffix=".mp3")
         with os.fdopen(fd, 'wb') as f:
             f.write(audio_data)
             
-        # Step 3 & 4: Merging Video
         jobs[job_id]["status"] = "merging_video"
         video_dur = get_media_duration(file_path)
         audio_dur = get_media_duration(tts_audio_path)
@@ -135,7 +137,6 @@ def process_video_task(job_id: str, file_path: str, filename: str, voice_name: s
         if process.returncode != 0:
             raise Exception(f"FFmpeg Error: {process.stderr}")
         
-        # Step 5: Uploading Final to Drive
         jobs[job_id]["status"] = "uploading_final_to_drive"
         drive_link = upload_to_drive(output_video_path, filename)
         jobs[job_id]["drive_link"] = drive_link
@@ -144,20 +145,19 @@ def process_video_task(job_id: str, file_path: str, filename: str, voice_name: s
         
     except Exception as e:
         jobs[job_id]["status"] = "failed"
-        # 🚨 Error အတိအကျကို UI ဆီ ပို့ပေးမည့် အပိုင်း 🚨
-        error_name = type(e).__name__
-        error_msg = str(e) if str(e).strip() else repr(e)
-        jobs[job_id]["error"] = f"[{error_name}] {error_msg}"
-        
-        print(f"--- SERVER ERROR LOG (Job: {job_id}) ---")
-        print(traceback.format_exc())
-        print("----------------------------------------")
+        jobs[job_id]["error"] = str(e)
     finally:
         for path in [file_path, tts_audio_path, output_video_path]:
             if path and os.path.exists(path): os.remove(path)
 
+# 🚨 user_api_key ကို လက်ခံမည့် Endpoint 🚨
 @app.post("/api/upload")
-async def upload_video(background_tasks: BackgroundTasks, file: UploadFile = File(...), voice: str = Form("Fenrir (Male)")):
+async def upload_video(
+    background_tasks: BackgroundTasks, 
+    file: UploadFile = File(...), 
+    voice: str = Form("Fenrir (Male)"), 
+    user_api_key: str = Form(None)
+):
     job_id = str(uuid.uuid4())
     
     fd, temp_file_path = tempfile.mkstemp(suffix=".mp4")
@@ -166,7 +166,7 @@ async def upload_video(background_tasks: BackgroundTasks, file: UploadFile = Fil
         
     jobs[job_id] = {"id": job_id, "status": "pending", "filename": file.filename}
     
-    background_tasks.add_task(process_video_task, job_id, temp_file_path, file.filename, voice)
+    background_tasks.add_task(process_video_task, job_id, temp_file_path, file.filename, voice, user_api_key)
     
     return {"success": True, "jobId": job_id}
 
