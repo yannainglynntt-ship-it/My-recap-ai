@@ -3,9 +3,13 @@ import uuid
 import tempfile
 import time
 import subprocess
+import json
 from fastapi import FastAPI, UploadFile, File, Form, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 import google.generativeai as genai
+from google.oauth2 import service_account
+from googleapiclient.discovery import build
+from googleapiclient.http import MediaFileUpload
 
 app = FastAPI()
 
@@ -30,11 +34,6 @@ def get_media_duration(file_path):
         return 0.0
 
 def upload_to_drive(file_path, filename):
-    import json
-    from google.oauth2 import service_account
-    from googleapiclient.discovery import build
-    from googleapiclient.http import MediaFileUpload
-    
     info_str = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON")
     if not info_str: return None
     
@@ -52,7 +51,7 @@ def process_video_task(job_id: str, file_path: str, filename: str, voice_name: s
     tts_audio_path = ""
     
     try:
-        # Step 1: Video ကို မြန်မာလို Transcript ထုတ်ခြင်း (Gemini 3 Flash Preview -> 2.5 Fallback)
+        # Step 1: Video မှ မြန်မာ transcript ထုတ်ခြင်း (Gemini 3 Flash Preview -> 2.5 Fallback)
         jobs[job_id]["status"] = "transcribing"
         video_file = genai.upload_file(path=file_path)
         
@@ -67,11 +66,12 @@ def process_video_task(job_id: str, file_path: str, filename: str, voice_name: s
         transcript = ""
         
         try:
+            # Gemini 3 Flash Preview အား အသုံးပြုခြင်း
             model = genai.GenerativeModel("gemini-3-flash-preview")
             response = model.generate_content([prompt, video_file])
             transcript = response.text
-        except Exception as e:
-            print(f"Fallback to 2.5 Flash: {e}")
+        except Exception:
+            # Fallback အနေဖြင့် Gemini 2.5 Flash ကို အသုံးပြုခြင်း
             model = genai.GenerativeModel("gemini-2.5-flash")
             response = model.generate_content([prompt, video_file])
             transcript = response.text
@@ -79,9 +79,9 @@ def process_video_task(job_id: str, file_path: str, filename: str, voice_name: s
         jobs[job_id]["transcript"] = transcript
         genai.delete_file(video_file.name)
         
-        # Step 2: Transcript မှ အသံပြောင်းခြင်း (Gemini 3.1 Flash TTS Preview)
+        # Step 2: Transcript မှ Voice Over ပြောင်းခြင်း (Gemini 3.1 Flash TTS Preview)
         jobs[job_id]["status"] = "generating_audio"
-        tts_model = genai.GenerativeModel("gemini-3.1-flash-tts-preview")
+        tts_model = genai.GenerativeModel("gemini-3.1-flash-tts-preview") #
         tts_prompt = f"Voice Profile: {voice_name}\nRead the following text naturally and fluently:\n{transcript}"
         tts_response = tts_model.generate_content(tts_prompt)
         
@@ -99,7 +99,7 @@ def process_video_task(job_id: str, file_path: str, filename: str, voice_name: s
         with os.fdopen(fd, 'wb') as f:
             f.write(audio_data)
             
-        # Step 3 & 4: Video နှင့် Voice Over ကို Duration ချိန်ညှိပြီး ပေါင်းစပ်ခြင်း
+        # Step 3 & 4: Audio နှင့် Video ကြာချိန် ညှိနှိုင်းပြီး ပေါင်းစပ်ခြင်း
         jobs[job_id]["status"] = "merging_video"
         
         video_dur = get_media_duration(file_path)
@@ -111,16 +111,18 @@ def process_video_task(job_id: str, file_path: str, filename: str, voice_name: s
         if audio_dur > video_dur and video_dur > 0:
             required_a_speed = audio_dur / video_dur
             if required_a_speed <= 1.1:
+                # 1.1x အတွင်းဆိုလျှင် audio ကိုသာ မြန်လိုက်မည်
                 a_tempo_factor = required_a_speed
             else:
+                # 1.1x ထက်ကျော်လျှင် audio ကို 1.1x ထားပြီး ကျန်တာကို video slow ချမည်
                 a_tempo_factor = 1.1
                 new_audio_dur = audio_dur / 1.1
-                v_pts_factor = new_audio_dur / video_dur # Video ကို slow ချမည်
+                v_pts_factor = new_audio_dur / video_dur
                 
         fd2, output_video_path = tempfile.mkstemp(suffix=".mp4")
         os.close(fd2)
         
-        # မူရင်း Video အသံကို ဖျောက်ပြီး မြန်မာ Audio ကို အစားထိုးခြင်း
+        # FFmpeg ဖြင့် Video နှင့် Audio အား ပေါင်းစပ်ခြင်း
         cmd = [
             "ffmpeg", "-y",
             "-i", file_path,
@@ -135,7 +137,7 @@ def process_video_task(job_id: str, file_path: str, filename: str, voice_name: s
         
         subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         
-        # Step 5: အချောသတ်ထားသော Video ကို Google Drive သို့ တင်ခြင်း
+        # Step 5: အချောသတ်ဗီဒီယိုအား Google Drive သို့ တင်ခြင်း
         jobs[job_id]["status"] = "uploading_final_to_drive"
         drive_link = upload_to_drive(output_video_path, filename)
         jobs[job_id]["drive_link"] = drive_link
@@ -146,9 +148,9 @@ def process_video_task(job_id: str, file_path: str, filename: str, voice_name: s
         jobs[job_id]["status"] = "failed"
         jobs[job_id]["error"] = str(e)
     finally:
-        if os.path.exists(file_path): os.remove(file_path)
-        if os.path.exists(tts_audio_path): os.remove(tts_audio_path)
-        if os.path.exists(output_video_path): os.remove(output_video_path)
+        # ယာယီဖိုင်များအား ပြန်လည်ဖျက်သိမ်းခြင်း
+        for path in [file_path, tts_audio_path, output_video_path]:
+            if path and os.path.exists(path): os.remove(path)
 
 @app.post("/api/upload")
 async def upload_video(background_tasks: BackgroundTasks, file: UploadFile = File(...), voice: str = Form("Fenrir (Male)")):
