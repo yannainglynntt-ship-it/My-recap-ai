@@ -1,0 +1,8 @@
+fastapi
+uvicorn
+python-multipart
+google-auth
+google-api-python-client
+google-generativeai
+httpx
+python-jose[cryptography]
