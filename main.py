@@ -50,15 +50,18 @@ def process_video_task(job_id: str, file_path: str, filename: str, voice_name: s
     video_file = None
     
     try:
-        active_key = user_api_key.strip() if user_api_key else os.getenv("GEMINI_API_KEY")
+        # 🚨 FIX 1: Render မှ API Key များကို Space နှင့် Quotes များ အလိုအလျောက် ဖယ်ရှားပေးခြင်း 🚨
+        render_key = os.getenv("GEMINI_API_KEY", "")
+        if render_key:
+            render_key = render_key.strip().replace('"', '').replace("'", "")
+            
+        active_key = user_api_key.strip() if user_api_key else render_key
         if not active_key:
             raise Exception("API Key မရှိပါ။ ကျေးဇူးပြု၍ သင့်ကိုယ်ပိုင် Gemini API Key အား ထည့်သွင်းပါ။")
             
         genai.configure(api_key=active_key)
 
         jobs[job_id]["status"] = "transcribing"
-        
-        # 🚨 FIX 1: API က 400 Error မပြအောင် mime_type အတိအကျ သတ်မှတ်ခြင်း 🚨
         video_file = genai.upload_file(path=file_path, mime_type="video/mp4")
         
         while video_file.state.name == "PROCESSING":
@@ -71,22 +74,36 @@ def process_video_task(job_id: str, file_path: str, filename: str, voice_name: s
         prompt = "You are a professional translator. Listen to this video and provide an accurate Burmese transcript of the speech. Only return the translated Burmese text without any other comments."
         transcript = ""
         
-        # 🚨 FIX 2: Video ဖတ်ရန်အတွက် အငြိမ်ဆုံး Model ကို ပြောင်းသုံးခြင်း 🚨
         try:
             model = genai.GenerativeModel("gemini-2.5-flash")
             response = model.generate_content([prompt, video_file])
-            transcript = response.text
+            # 🚨 FIX 2: Safety Policy ကြောင့် စာသားမရလျှင် Error ဖမ်းခြင်း 🚨
+            try:
+                transcript = response.text
+            except ValueError:
+                transcript = ""
         except Exception as e_inner:
             print(f"2.5 Flash Failed: {e_inner}. Falling back to 1.5 Flash...")
             model = genai.GenerativeModel("gemini-1.5-flash")
             response = model.generate_content([prompt, video_file])
-            transcript = response.text
+            try:
+                transcript = response.text
+            except ValueError:
+                transcript = ""
+                
+        # 🚨 FIX 3: Transcript အလွတ်ကြီးဖြစ်နေလျှင် Invalid Argument မတက်စေရန် စစ်ဆေးခြင်း 🚨
+        if not transcript or not transcript.strip():
+            raise Exception("Video ထဲမှ စကားပြောသံကို ရှာမတွေ့ပါ (သို့) AI Safety Policy အရ ပိတ်ပင်ခံရပါသည်။ တခြား Video ဖြင့် စမ်းကြည့်ပါ။")
             
         jobs[job_id]["transcript"] = transcript
         
         jobs[job_id]["status"] = "generating_audio"
         tts_model = genai.GenerativeModel("gemini-3.1-flash-tts-preview")
-        tts_prompt = f"Voice Profile: {voice_name}\nRead the following text naturally and fluently:\n{transcript}"
+        
+        # Prompt အား ပိုမိုရိုးရှင်းအောင် ပြင်ဆင်ခြင်း
+        clean_transcript = transcript.strip()
+        tts_prompt = f"Voice character: {voice_name}. Read this text: {clean_transcript}"
+        
         tts_response = tts_model.generate_content(tts_prompt)
         
         audio_data = None
