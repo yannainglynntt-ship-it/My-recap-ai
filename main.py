@@ -11,6 +11,7 @@ import google.generativeai as genai
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaFileUpload
+from gtts import gTTS
 
 app = FastAPI()
 
@@ -50,7 +51,7 @@ def process_video_task(job_id: str, file_path: str, filename: str, voice_name: s
     video_file = None
     
     try:
-        # API Key ရှင်းလင်းခြင်း
+        # API Key အား Space နှင့် မျက်တောင်ကွင်းများ ဖယ်ရှား၍ သန့်စင်ခြင်း
         render_key = os.getenv("GEMINI_API_KEY", "")
         if render_key:
             render_key = render_key.strip().replace('"', '').replace("'", "")
@@ -74,13 +75,14 @@ def process_video_task(job_id: str, file_path: str, filename: str, voice_name: s
         prompt = "You are a professional translator. Listen to this video and provide an accurate Burmese transcript of the speech. Only return the translated Burmese text without any other comments."
         transcript = ""
         
+        # Transcript အပိုင်း (Gemini 3 Flash ကို အဓိကသုံးပြီး Error တက်ပါက 2.5 ကို ပြောင်းသုံးမည်)
         try:
-            model = genai.GenerativeModel("gemini-2.5-flash")
+            model = genai.GenerativeModel("gemini-3-flash-preview")
             response = model.generate_content([prompt, video_file])
             transcript = response.text if response.text else ""
         except Exception as e_inner:
-            print(f"2.5 Flash Failed: {e_inner}. Falling back to 1.5 Flash...")
-            model = genai.GenerativeModel("gemini-1.5-flash")
+            print(f"3 Flash Failed: {e_inner}. Falling back to 2.5 Flash...")
+            model = genai.GenerativeModel("gemini-2.5-flash")
             response = model.generate_content([prompt, video_file])
             transcript = response.text if response.text else ""
                 
@@ -92,11 +94,12 @@ def process_video_task(job_id: str, file_path: str, filename: str, voice_name: s
         
         jobs[job_id]["status"] = "generating_audio"
         
-        # 🚨 FIX: အသံထုတ်သည့်အပိုင်းတွင် Error တက်ပါက gTTS သို့ အလိုအလျောက် ပြောင်းလဲမည့်စနစ် 🚨
+        # Voice Over အပိုင်း (Gemini 3.1 TTS ကို အဓိကသုံးပြီး Error တက်ပါက gTTS ကို ပြောင်းသုံးမည်)
         try:
             tts_model = genai.GenerativeModel("gemini-3.1-flash-tts-preview")
-            # Prompt အား အရိုးရှင်းဆုံးဖြစ်အောင် ပြင်ဆင်ထားသည်
-            tts_response = tts_model.generate_content(clean_transcript)
+            tts_prompt = f"Voice character: {voice_name}. Read this text: {clean_transcript}"
+            
+            tts_response = tts_model.generate_content(tts_prompt)
             
             audio_data = None
             if tts_response.candidates:
@@ -113,15 +116,15 @@ def process_video_task(job_id: str, file_path: str, filename: str, voice_name: s
                 f.write(audio_data)
                 
         except Exception as tts_err:
-            print(f"Gemini TTS Failed ({tts_err}). Automatically falling back to gTTS...")
-            # Gemini TTS Error တက်ပါက gTTS ဖြင့် အစားထိုး အလုပ်လုပ်မည်
-            from gtts import gTTS
+            print(f"Gemini 3.1 TTS Failed ({tts_err}). Automatically falling back to gTTS...")
             fd, tts_audio_path = tempfile.mkstemp(suffix=".mp3")
             os.close(fd)
             tts = gTTS(text=clean_transcript, lang='my')
             tts.save(tts_audio_path)
             
         jobs[job_id]["status"] = "merging_video"
+        
+        # Audio နှင့် Video အချိန်ကြာမြင့်မှု တွက်ချက်ပြီး အချိုးညီအောင် ညှိခြင်း (Sync Logic)
         video_dur = get_media_duration(file_path)
         audio_dur = get_media_duration(tts_audio_path)
         
@@ -140,6 +143,7 @@ def process_video_task(job_id: str, file_path: str, filename: str, voice_name: s
         fd2, output_video_path = tempfile.mkstemp(suffix=".mp4")
         os.close(fd2)
         
+        # FFmpeg အား ultrafast preset ဖြင့် မြန်ဆန်စွာ အလုပ်လုပ်စေခြင်း
         cmd = [
             "ffmpeg", "-y",
             "-i", file_path,
@@ -148,6 +152,7 @@ def process_video_task(job_id: str, file_path: str, filename: str, voice_name: s
             "-map", "[v]",
             "-map", "[a]",
             "-c:v", "libx264",
+            "-preset", "ultrafast",
             "-c:a", "aac",
             output_video_path
         ]
