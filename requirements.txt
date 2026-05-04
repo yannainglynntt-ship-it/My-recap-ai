@@ -1,8 +1,7 @@
 fastapi
 uvicorn
 python-multipart
-google-auth
+google-generativeai>=0.8.0
 google-api-python-client
-google-generativeai
-httpx
-python-jose[cryptography]
+google-auth-httplib2
+google-auth-oauthlib
