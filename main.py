@@ -6,10 +6,11 @@ import subprocess
 import traceback
 import requests
 import json
+import asyncio
+import edge_tts
 from fastapi import FastAPI, UploadFile, File, Form, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 import google.generativeai as genai
-from gtts import gTTS
 
 app = FastAPI()
 
@@ -23,7 +24,6 @@ app.add_middleware(
 jobs = {}
 
 def get_media_duration(file_path):
-    """FFprobe ကိုသုံး၍ ဗီဒီယို/အသံ ကြာချိန်ကို တိုင်းတာခြင်း"""
     cmd = ["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "default=noprint_wrappers=1:nokey=1", file_path]
     result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
     try:
@@ -32,13 +32,12 @@ def get_media_duration(file_path):
         return 0.0
 
 def upload_to_cloud(file_path, filename):
-    """Google Drive အစား Free Cloud များသို့ Video တင်၍ Link ထုတ်ပေးခြင်း (Fallback ပါဝင်သည်)"""
+    # Free Cloud Storage သို့ တင်သည့် အပိုင်း (Catbox -> Tmpfiles Fallback)
     headers = {
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
     }
     safe_filename = "recap_output.mp4"
     
-    # ၁။ Catbox သို့ အရင်တင်ကြည့်မည်
     try:
         with open(file_path, 'rb') as f:
             response = requests.post(
@@ -53,7 +52,6 @@ def upload_to_cloud(file_path, filename):
     except Exception as e:
         print(f"Catbox Upload Failed: {e}")
 
-    # ၂။ Catbox အဆင်မပြေပါက Tmpfiles သို့ ပြောင်းတင်မည်
     try:
         with open(file_path, 'rb') as f:
             response = requests.post(
@@ -77,7 +75,6 @@ def process_video_task(job_id: str, file_path: str, filename: str, voice_name: s
     video_file = None
     
     try:
-        # API Key သန့်စင်ခြင်း
         render_key = os.getenv("GEMINI_API_KEY", "")
         if render_key:
             render_key = render_key.strip().replace('"', '').replace("'", "")
@@ -88,7 +85,6 @@ def process_video_task(job_id: str, file_path: str, filename: str, voice_name: s
             
         genai.configure(api_key=active_key)
 
-        # အဆင့် ၁ - Video ကို Gemini ပေါ်တင်ခြင်း
         jobs[job_id]["status"] = "transcribing"
         video_file = genai.upload_file(path=file_path, mime_type="video/mp4")
         
@@ -99,7 +95,7 @@ def process_video_task(job_id: str, file_path: str, filename: str, voice_name: s
         if video_file.state.name == "FAILED":
             raise Exception("Gemini API က ဗီဒီယိုဖိုင်အား ဖတ်၍မရပါ။")
             
-        # အဆင့် ၂ - မြန်မာစာသား ထုတ်ယူခြင်း (Gemini 3 Flash -> Fallback: 2.5 Flash)
+        # အဆင့် ၁ - Transcript ထုတ်ခြင်း (Gemini 3 Flash -> Fallback: 2.5 Flash)
         prompt = "You are a professional translator. Listen to this video and provide an accurate Burmese transcript of the speech. Only return the translated Burmese text without any other comments."
         transcript = ""
         
@@ -118,9 +114,12 @@ def process_video_task(job_id: str, file_path: str, filename: str, voice_name: s
         jobs[job_id]["transcript"] = transcript
         clean_transcript = transcript.strip()
         
-        # အဆင့် ၃ - မြန်မာ Voice Over ထုတ်ခြင်း (Gemini 3.1 TTS -> Fallback: gTTS)
         jobs[job_id]["status"] = "generating_audio"
         
+        fd, tts_audio_path = tempfile.mkstemp(suffix=".mp3")
+        os.close(fd)
+
+        # အဆင့် ၂ - အသံထုတ်ခြင်း (Primary: Gemini 3.1 TTS -> Fallback: Edge Neural TTS)
         try:
             tts_model = genai.GenerativeModel("gemini-3.1-flash-tts-preview")
             tts_prompt = f"Voice character: {voice_name}. Read this text: {clean_transcript}"
@@ -134,39 +133,40 @@ def process_video_task(job_id: str, file_path: str, filename: str, voice_name: s
                         break
             
             if not audio_data:
-                raise Exception("Gemini TTS No Data")
+                raise Exception("Gemini TTS returned no audio data")
                 
-            fd, tts_audio_path = tempfile.mkstemp(suffix=".mp3")
-            with os.fdopen(fd, 'wb') as f:
+            with open(tts_audio_path, 'wb') as f:
                 f.write(audio_data)
-        except:
-            print("Gemini TTS Failed, using gTTS fallback...")
-            fd, tts_audio_path = tempfile.mkstemp(suffix=".mp3")
-            os.close(fd)
-            tts = gTTS(text=clean_transcript, lang='my')
-            tts.save(tts_audio_path)
+                
+        except Exception as tts_err:
+            print(f"Gemini TTS Failed: {tts_err}. Automatically falling back to Edge Neural TTS...")
             
-        # အဆင့် ၄ - Video နှင့် Audio အား Fit ဖြစ်အောင် ပေါင်းစပ်ခြင်း
+            # Error တက်ပါက Edge TTS ဖြင့် လူအစစ်အသံကဲ့သို့ အစားထိုးမည်
+            edge_voice = "my-MM-NilarNeural" if "Female" in voice_name else "my-MM-ThihaNeural"
+            
+            async def generate_edge_audio():
+                communicate = edge_tts.Communicate(clean_transcript, edge_voice)
+                await communicate.save(tts_audio_path)
+                
+            asyncio.run(generate_edge_audio())
+            
         jobs[job_id]["status"] = "merging_video"
         
         video_dur = get_media_duration(file_path)
         audio_dur = get_media_duration(tts_audio_path)
         
+        # အဆင့် ၃ - Audio ကို 1.1x Speed ပုံသေထားပြီး Video နှင့် အချိန်ကိုက် ညှိခြင်း
+        a_tempo_factor = 1.1  # အသံကို ၁၀% ပိုမြန်အောင် ပုံသေသတ်မှတ်ထားသည်
+        new_audio_dur = audio_dur / 1.1
         v_pts_factor = 1.0
-        a_tempo_factor = 1.0
         
-        if audio_dur > video_dur and video_dur > 0:
-            required_a_speed = audio_dur / video_dur
-            if required_a_speed <= 1.1:
-                a_tempo_factor = required_a_speed
-            else:
-                a_tempo_factor = 1.1
-                v_pts_factor = (audio_dur / 1.1) / video_dur
+        # 1.1x ပြောင်းပြီးတာတောင် အသံက Video ထက် ရှည်နေသေးပါက Video ကို Slow-motion လုပ်မည်
+        if new_audio_dur > video_dur and video_dur > 0:
+            v_pts_factor = new_audio_dur / video_dur
                 
         fd2, output_video_path = tempfile.mkstemp(suffix=".mp4")
         os.close(fd2)
         
-        # FFmpeg အား ultrafast preset ဖြင့် CPU သက်သာစွာ ပေါင်းစပ်ခိုင်းခြင်း
         cmd = [
             "ffmpeg", "-y",
             "-i", file_path,
@@ -181,7 +181,6 @@ def process_video_task(job_id: str, file_path: str, filename: str, voice_name: s
         if process.returncode != 0:
             raise Exception(f"FFmpeg Merge Failed: {process.stderr}")
         
-        # အဆင့် ၅ - Cloud သို့ တင်ခြင်း
         jobs[job_id]["status"] = "uploading_final_to_drive" 
         final_link = upload_to_cloud(output_video_path, filename)
         
