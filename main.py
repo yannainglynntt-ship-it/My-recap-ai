@@ -21,6 +21,7 @@ app.add_middleware(
 )
 
 jobs = {}
+MAX_CONCURRENT_JOBS = 1 # 🚨 0.1 CPU အတွက် (၁) ကြိမ်လျှင် (၁) ခုသာ ခွင့်ပြုမည် 🚨
 
 def get_media_duration(file_path):
     cmd = ["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "default=noprint_wrappers=1:nokey=1", file_path]
@@ -30,16 +31,13 @@ def get_media_duration(file_path):
     except:
         return 0.0
 
-# 🚨 Server မလေးစေရန် ၂၄ နာရီကျော်သော Video များအား ဖျက်ပေးမည့် စနစ် 🚨
 def cleanup_old_jobs():
     current_time = time.time()
     keys_to_delete = []
     
     for j_id, job in jobs.items():
-        # 86400 စက္ကန့် (၂၄ နာရီ) ကျော်သွားသော Job များကို ရှာမည်
         if current_time - job.get("created_at", current_time) > 86400:
             video_path = job.get("video_path")
-            # ဖိုင်ကို Server ပေါ်မှ အပြီးတိုင် ဖျက်မည်
             if video_path and os.path.exists(video_path):
                 try:
                     os.remove(video_path)
@@ -47,7 +45,6 @@ def cleanup_old_jobs():
                     pass
             keys_to_delete.append(j_id)
             
-    # Memory (RAM) ထဲမှပါ ရှင်းလင်းမည်
     for k in keys_to_delete:
         del jobs[k]
 
@@ -183,15 +180,20 @@ async def upload_video(
     voice: str = Form("Fenrir (Male)"),
     user_api_key: str = Form(None)
 ):
-    # 🚨 Video အသစ်တင်တိုင်း Server ရှိ အမှိုက်ဟောင်းများကို အရင်ရှင်းလင်းမည် 🚨
     cleanup_old_jobs()
     
+    # 🚨 CPU အားမပိစေရန် Limit စစ်ဆေးခြင်း 🚨
+    active_statuses = ["pending", "transcribing", "generating_audio", "merging_video", "uploading_final_to_drive"]
+    active_jobs = sum(1 for j in jobs.values() if j.get("status") in active_statuses)
+    
+    if active_jobs >= MAX_CONCURRENT_JOBS:
+        return {"success": False, "error": "ဆာဗာတွင် အခြားသူ Video ပြုလုပ်နေပါသည်။ CPU မပိစေရန် ခဏစောင့်ပြီးမှ ထပ်မံကြိုးစားပါ။"}
+        
     job_id = str(uuid.uuid4())
     fd, temp_file_path = tempfile.mkstemp(suffix=".mp4")
     with os.fdopen(fd, 'wb') as f:
         f.write(await file.read())
         
-    # created_at အား ထည့်သွင်းမှတ်သားထားမည်
     jobs[job_id] = {
         "id": job_id, 
         "status": "pending", 
