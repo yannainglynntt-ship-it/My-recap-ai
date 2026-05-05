@@ -5,6 +5,7 @@ import time
 import subprocess
 import traceback
 import asyncio
+import gc  # <--- Memory ရှင်းထုတ်ရန် ထပ်ထည့်ထားသည်
 import edge_tts
 from fastapi import FastAPI, UploadFile, File, Form, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
@@ -36,7 +37,8 @@ def cleanup_old_jobs():
     keys_to_delete = []
     
     for j_id, job in jobs.items():
-        if current_time - job.get("created_at", current_time) > 86400:
+        # 86400 (၂၄ နာရီ) အစား 14400 (၄ နာရီ) သို့ ပြောင်းထားသည်
+        if current_time - job.get("created_at", current_time) > 14400:
             video_path = job.get("video_path")
             if video_path and os.path.exists(video_path):
                 try:
@@ -47,6 +49,21 @@ def cleanup_old_jobs():
             
     for k in keys_to_delete:
         del jobs[k]
+        
+    # Render 512MB RAM အားမပိစေရန် မလိုအပ်သော memory များကို ရှင်းထုတ်သည်
+    gc.collect()
+
+# နောက်ကွယ်တွင် ၄ နာရီတစ်ခါ Auto အလုပ်လုပ်မည့် Function
+async def periodic_cleanup():
+    while True:
+        await asyncio.sleep(14400) # ၄ နာရီတိုင်း (စက္ကန့် 14400) စောင့်မည်
+        cleanup_old_jobs()         # Cache နှင့် Data များကို ရှင်းလင်းမည်
+        print("System auto-cleanup completed (4-hour cycle).")
+
+# Server စတင်သည်နှင့် Auto-cleanup ကို background တွင် အလုပ်လုပ်စေမည်
+@app.on_event("startup")
+async def startup_event():
+    asyncio.create_task(periodic_cleanup())
 
 def process_video_task(job_id: str, file_path: str, filename: str, voice_name: str, user_api_key: str):
     output_video_path = ""
@@ -180,7 +197,7 @@ async def upload_video(
     voice: str = Form("Fenrir (Male)"),
     user_api_key: str = Form(None)
 ):
-    cleanup_old_jobs()
+    cleanup_old_jobs() # Upload လုပ်တိုင်းလည်း လိုအပ်ရင် ရှင်းပေးပါမည်
     
     # 🚨 CPU အားမပိစေရန် Limit စစ်ဆေးခြင်း 🚨
     active_statuses = ["pending", "transcribing", "generating_audio", "merging_video", "uploading_final_to_drive"]
