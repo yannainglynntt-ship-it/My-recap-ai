@@ -8,7 +8,7 @@ import asyncio
 import edge_tts
 from fastapi import FastAPI, UploadFile, File, Form, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse  # 🚨 အသစ်ထည့်ထားသည်
+from fastapi.responses import FileResponse
 import google.generativeai as genai
 
 app = FastAPI()
@@ -110,12 +110,18 @@ def process_video_task(job_id: str, file_path: str, filename: str, voice_name: s
         video_dur = get_media_duration(file_path)
         audio_dur = get_media_duration(tts_audio_path)
         
-        a_tempo_factor = 1.1 
-        new_audio_dur = audio_dur / 1.1
+        # 🚨 Smart Sync Logic အသစ်စတင်သည် 🚨
         v_pts_factor = 1.0
+        a_tempo_factor = 1.0 
         
-        if new_audio_dur > video_dur and video_dur > 0:
-            v_pts_factor = new_audio_dur / video_dur
+        if audio_dur > video_dur and video_dur > 0:
+            # အသံက Video ထက် ရှည်နေမှသာ 1.1x အမြန်နှုန်း ပြောင်းမည်
+            a_tempo_factor = 1.1
+            new_audio_dur = audio_dur / 1.1
+            
+            # 1.1x ပြောင်းတာတောင် အသံက ဆက်ရှည်နေသေးရင် Video ကို နှေးပေးမည်
+            if new_audio_dur > video_dur:
+                v_pts_factor = new_audio_dur / video_dur
                 
         fd2, output_video_path = tempfile.mkstemp(suffix=".mp4")
         os.close(fd2)
@@ -134,11 +140,9 @@ def process_video_task(job_id: str, file_path: str, filename: str, voice_name: s
         if process.returncode != 0:
             raise Exception(f"FFmpeg Merge Failed: {process.stderr}")
         
-        # 🚨 Cloud သို့ တင်မည့်အစား Render မှ တိုက်ရိုက် Link ဖန်တီးပေးလိုက်ပါပြီ 🚨
         jobs[job_id]["status"] = "uploading_final_to_drive" 
         jobs[job_id]["video_path"] = output_video_path
         
-        # သင့် Render URL မှတိုက်ရိုက် Download ခေါ်မည်
         jobs[job_id]["drive_link"] = f"https://my-recap-ai-onke.onrender.com/api/download/{job_id}"
         jobs[job_id]["status"] = "completed"
         
@@ -151,7 +155,6 @@ def process_video_task(job_id: str, file_path: str, filename: str, voice_name: s
             try: genai.delete_file(video_file.name)
             except: pass
             
-        # 🚨 အရေးကြီး - Download ဆွဲနိုင်ရန် output_video ကို မဖျက်တော့ပါ 🚨
         for path in [file_path, tts_audio_path]:
             if path and os.path.exists(path): 
                 try: os.remove(path)
@@ -173,7 +176,6 @@ async def upload_video(
     background_tasks.add_task(process_video_task, job_id, temp_file_path, file.filename, voice, user_api_key)
     return {"success": True, "jobId": job_id}
 
-# 🚨 တိုက်ရိုက် Download ဆွဲရန် Endpoint အသစ် 🚨
 @app.get("/api/download/{job_id}")
 async def download_video(job_id: str):
     job = jobs.get(job_id)
