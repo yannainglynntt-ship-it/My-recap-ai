@@ -2,5 +2,6 @@ fastapi
 uvicorn
 python-multipart
 google-generativeai>=0.8.0
-gTTS
+edge-tts
 requests
+
