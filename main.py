@@ -30,6 +30,27 @@ def get_media_duration(file_path):
     except:
         return 0.0
 
+# 🚨 Server မလေးစေရန် ၂၄ နာရီကျော်သော Video များအား ဖျက်ပေးမည့် စနစ် 🚨
+def cleanup_old_jobs():
+    current_time = time.time()
+    keys_to_delete = []
+    
+    for j_id, job in jobs.items():
+        # 86400 စက္ကန့် (၂၄ နာရီ) ကျော်သွားသော Job များကို ရှာမည်
+        if current_time - job.get("created_at", current_time) > 86400:
+            video_path = job.get("video_path")
+            # ဖိုင်ကို Server ပေါ်မှ အပြီးတိုင် ဖျက်မည်
+            if video_path and os.path.exists(video_path):
+                try:
+                    os.remove(video_path)
+                except:
+                    pass
+            keys_to_delete.append(j_id)
+            
+    # Memory (RAM) ထဲမှပါ ရှင်းလင်းမည်
+    for k in keys_to_delete:
+        del jobs[k]
+
 def process_video_task(job_id: str, file_path: str, filename: str, voice_name: str, user_api_key: str):
     output_video_path = ""
     tts_audio_path = ""
@@ -110,18 +131,13 @@ def process_video_task(job_id: str, file_path: str, filename: str, voice_name: s
         video_dur = get_media_duration(file_path)
         audio_dur = get_media_duration(tts_audio_path)
         
-        # 🚨 Smart Sync Logic အသစ်စတင်သည် 🚨
         v_pts_factor = 1.0
-        a_tempo_factor = 1.0 
+        a_tempo_factor = 1.1 
         
-        if audio_dur > video_dur and video_dur > 0:
-            # အသံက Video ထက် ရှည်နေမှသာ 1.1x အမြန်နှုန်း ပြောင်းမည်
-            a_tempo_factor = 1.1
-            new_audio_dur = audio_dur / 1.1
-            
-            # 1.1x ပြောင်းတာတောင် အသံက ဆက်ရှည်နေသေးရင် Video ကို နှေးပေးမည်
-            if new_audio_dur > video_dur:
-                v_pts_factor = new_audio_dur / video_dur
+        new_audio_dur = audio_dur / 1.1
+        
+        if new_audio_dur > video_dur and video_dur > 0:
+            v_pts_factor = new_audio_dur / video_dur
                 
         fd2, output_video_path = tempfile.mkstemp(suffix=".mp4")
         os.close(fd2)
@@ -167,12 +183,22 @@ async def upload_video(
     voice: str = Form("Fenrir (Male)"),
     user_api_key: str = Form(None)
 ):
+    # 🚨 Video အသစ်တင်တိုင်း Server ရှိ အမှိုက်ဟောင်းများကို အရင်ရှင်းလင်းမည် 🚨
+    cleanup_old_jobs()
+    
     job_id = str(uuid.uuid4())
     fd, temp_file_path = tempfile.mkstemp(suffix=".mp4")
     with os.fdopen(fd, 'wb') as f:
         f.write(await file.read())
         
-    jobs[job_id] = {"id": job_id, "status": "pending", "filename": file.filename}
+    # created_at အား ထည့်သွင်းမှတ်သားထားမည်
+    jobs[job_id] = {
+        "id": job_id, 
+        "status": "pending", 
+        "filename": file.filename,
+        "created_at": time.time()
+    }
+    
     background_tasks.add_task(process_video_task, job_id, temp_file_path, file.filename, voice, user_api_key)
     return {"success": True, "jobId": job_id}
 
@@ -180,7 +206,7 @@ async def upload_video(
 async def download_video(job_id: str):
     job = jobs.get(job_id)
     if not job or "video_path" not in job or not os.path.exists(job["video_path"]):
-        return {"error": "Video not found"}
+        return {"error": "Video not found (or expired)"}
     return FileResponse(job["video_path"], media_type="video/mp4", filename=f"recap_{job['filename']}")
 
 @app.get("/api/status/{job_id}")
